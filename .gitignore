@@ -1,0 +1,29 @@
+# Compilation outputs
+build/
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+*.o
+*.d
+*.su
+
+# IDE - STM32CubeIDE / Eclipse local settings
+.settings/
+.cache/
+.metadata/
+
+# IDE - VS Code local files
+.vscode/ipch/
+.vscode/msvc.analysis.lastcodeanalysistime
+compile_commands.json
+
+# Operating System files
+.DS_Store
+Thumbs.db
+
+# Backup and temporary files
+*.bak
+*~
+*.swp
