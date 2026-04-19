@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "bluenrg_conf.h"
 #include "cmsis_os.h"
 #include "dfsdm.h"
 #include "quadspi.h"
@@ -26,6 +27,10 @@
 #include "usb_otg.h"
 #include "gpio.h"
 #include "app_bluenrg_ms.h"
+#include <string.h>
+#include "b_l475e_iot01a1_bus.h"
+#include "lsm6dsl.h"
+#include <stdio.h>
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -63,7 +68,13 @@ void MX_FREERTOS_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+extern UART_HandleTypeDef huart1;
 
+int _write(int file, char *ptr, int len)
+{
+  HAL_UART_Transmit(&huart1, (uint8_t *)ptr, len, HAL_MAX_DELAY);
+  return len;
+}
 /* USER CODE END 0 */
 
 /**
@@ -74,7 +85,7 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-
+  PRINTF("\r\n start! \r\n");
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -104,7 +115,6 @@ int main(void)
   MX_USART1_UART_Init();
   MX_USART3_UART_Init();
   MX_USB_OTG_FS_PCD_Init();
-  MX_BlueNRG_MS_Init();
   /* USER CODE BEGIN 2 */
 
   /* USER CODE END 2 */

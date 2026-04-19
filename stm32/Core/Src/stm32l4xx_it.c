@@ -85,7 +85,9 @@ void NMI_Handler(void)
 void HardFault_Handler(void)
 {
   /* USER CODE BEGIN HardFault_IRQn 0 */
-
+  extern UART_HandleTypeDef huart1;
+  uint8_t msg[] = "!!! HARDFAULT !!!\r\n";
+  HAL_UART_Transmit(&huart1, msg, sizeof(msg)-1, 1000);
   /* USER CODE END HardFault_IRQn 0 */
   while (1)
   {

@@ -46,7 +46,7 @@ int32_t HCI_TL_SPI_Init(void* pConf)
 {
   GPIO_InitTypeDef GPIO_InitStruct;
 
-  // __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOE_CLK_ENABLE();
 
@@ -263,7 +263,7 @@ void hci_tl_lowlevel_init(void)
   /* Register event irq handler */
   HAL_EXTI_GetHandle(&hexti6, EXTI_LINE_6);
   HAL_EXTI_RegisterCallback(&hexti6, HAL_EXTI_COMMON_CB_ID, hci_tl_lowlevel_isr);
-  HAL_NVIC_SetPriority(EXTI9_5_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(EXTI9_5_IRQn, 6, 0);
   HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
 
   /* USER CODE BEGIN hci_tl_lowlevel_init 3 */
@@ -280,15 +280,13 @@ void hci_tl_lowlevel_init(void)
   */
 void hci_tl_lowlevel_isr(void)
 {
-  /* Call hci_notify_asynch_evt() */
-  while(IsDataAvailable())
+  while (IsDataAvailable())
   {
     if (hci_notify_asynch_evt(NULL))
     {
-      return;
+      break;
     }
   }
-
   /* USER CODE BEGIN hci_tl_lowlevel_isr */
   BLE_IRQ_Notify();
   /* USER CODE END hci_tl_lowlevel_isr */

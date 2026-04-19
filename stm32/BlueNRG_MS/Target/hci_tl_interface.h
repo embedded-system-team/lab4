@@ -39,7 +39,7 @@
 #define HCI_TL_SPI_CS_PORT    GPIOD
 #define HCI_TL_SPI_CS_PIN     GPIO_PIN_13
 
-#define HCI_TL_RST_PORT       GPIOE
+#define HCI_TL_RST_PORT       GPIOA
 #define HCI_TL_RST_PIN        GPIO_PIN_8
 
 /* Exported variables --------------------------------------------------------*/

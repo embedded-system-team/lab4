@@ -49,7 +49,6 @@ Core/Src/stm32l4xx_it.c \
 Core/Src/stm32l4xx_hal_msp.c \
 Core/Src/stm32l4xx_hal_timebase_tim.c \
 BlueNRG_MS/App/gatt_db.c \
-BlueNRG_MS/App/sensor.c \
 BlueNRG_MS/App/app_bluenrg_ms.c \
 BlueNRG_MS/Target/hci_tl_interface.c \
 Drivers/BSP/Components/lsm6dsl/lsm6dsl_reg.c \
