@@ -44,7 +44,9 @@ int32_t HCI_TL_SPI_Init(void* pConf)
 {
   GPIO_InitTypeDef GPIO_InitStruct;
 
-  __HAL_RCC_GPIOA_CLK_ENABLE();
+  // __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
+  __HAL_RCC_GPIOE_CLK_ENABLE();
 
   /* Configure EXTI Line */
   GPIO_InitStruct.Pin = HCI_TL_SPI_EXTI_PIN;
