@@ -1,204 +1,340 @@
-/* USER CODE BEGIN Header */
 /**
   ******************************************************************************
-  * File Name          : freertos.c
-  * Description        : Code for freertos applications
-  ******************************************************************************
-  * @attention
+  * @file    Core/Src/freertos.c
+  * @brief   FreeRTOS task implementations
   *
-  * Copyright (c) 2026 STMicroelectronics.
-  * All rights reserved.
+  *          TASK_BLE:
+  *            - Waits for BLE IRQ semaphore (given by hci_tl_lowlevel_isr)
+  *            - Calls MX_BlueNRG_MS_Process() to dispatch HCI events
   *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
+  *          TASK_ACC:
+  *            - Reads LSM6DSL acceleration via official BSP driver
+  *            - Sends data to TASK_BLE via accelQueue
+  *            - Adjusts sampling period according to current_odr_idx
   ******************************************************************************
   */
-/* USER CODE END Header */
 
 /* Includes ------------------------------------------------------------------*/
 #include "FreeRTOS.h"
 #include "task.h"
-#include "main.h"
-#include "cmsis_os.h"
+#include "queue.h"
+#include "semphr.h"
+#include "cmsis_os2.h"
 
-/* Private includes ----------------------------------------------------------*/
+#include "app_bluenrg_ms.h"
+#include "gatt_db.h"
+#include "b_l475e_iot01a1.h"
+
+/* LSM6DSL official BSP driver */
+#include "b_l475e_iot01a1_motion_sensors.h"
+
 /* USER CODE BEGIN Includes */
-
 /* USER CODE END Includes */
 
-/* Private typedef -----------------------------------------------------------*/
-/* USER CODE BEGIN PTD */
+/* Private defines -----------------------------------------------------------*/
 
-/* USER CODE END PTD */
+/*
+ * ODR period lookup table (milliseconds)
+ * Index: AccODR_Index_t
+ *   0 → 12.5 Hz →  80 ms
+ *   1 →  26 Hz  →  38 ms
+ *   2 →  52 Hz  →  19 ms
+ *   3 → 104 Hz  →   9 ms
+ */
+static const uint32_t ODR_PERIOD_MS[4] = { 80U, 38U, 19U, 9U };
 
-/* Private define ------------------------------------------------------------*/
-/* USER CODE BEGIN PD */
-
-/* USER CODE END PD */
-
-/* Private macro -------------------------------------------------------------*/
-/* USER CODE BEGIN PM */
-
-/* USER CODE END PM */
+/*
+ * ODR lookup table for BSP driver
+ * Maps AccODR_Index_t to BSP_MOTION_SENSOR_SetOutputDataRate() parameter (Hz)
+ */
+static const float ODR_HZ[4] = { 12.5f, 26.0f, 52.0f, 104.0f };
 
 /* Private variables ---------------------------------------------------------*/
-/* USER CODE BEGIN Variables */
 
-/* USER CODE END Variables */
-/* Definitions for defaultTask */
-osThreadId_t defaultTaskHandle;
-const osThreadAttr_t defaultTask_attributes = {
-  .name = "defaultTask",
-  .stack_size = 128 * 4,
-  .priority = (osPriority_t) osPriorityNormal,
-};
-/* Definitions for Task_BLE */
-osThreadId_t Task_BLEHandle;
-const osThreadAttr_t Task_BLE_attributes = {
-  .name = "Task_BLE",
-  .stack_size = 512 * 4,
-  .priority = (osPriority_t) osPriorityAboveNormal,
-};
-/* Definitions for Task_ACC */
-osThreadId_t Task_ACCHandle;
-const osThreadAttr_t Task_ACC_attributes = {
-  .name = "Task_ACC",
-  .stack_size = 256 * 4,
-  .priority = (osPriority_t) osPriorityNormal,
-};
-/* Definitions for accelQueue */
-osMessageQueueId_t accelQueueHandle;
-const osMessageQueueAttr_t accelQueue_attributes = {
-  .name = "accelQueue"
-};
-/* Definitions for freqMutex */
+/* Acceleration data packet passed through accelQueue */
+typedef struct {
+  int16_t x;
+  int16_t y;
+  int16_t z;
+} AccelData_t;
+
+/* ---- FreeRTOS object handles (defined here, declared extern elsewhere) ---- */
+
+/* Semaphore: given by hci_tl_lowlevel_isr(), taken by TASK_BLE */
+osSemaphoreId_t bleSemHandle;
+
+/* Mutex: protects current_odr_idx between TASK_BLE (write) and TASK_ACC (read) */
 osMutexId_t freqMutexHandle;
-const osMutexAttr_t freqMutex_attributes = {
-  .name = "freqMutex"
-};
+
+/* Queue: TASK_ACC → TASK_BLE, carries AccelData_t */
+osMessageQueueId_t accelQueueHandle;
+
+/* Task handles */
+osThreadId_t taskBLEHandle;
+osThreadId_t taskACCHandle;
+
+/* Shared state -----------------------------------------------------------*/
+
+/* Current ODR index - written by TASK_BLE on Char_B write, read by TASK_ACC */
+volatile uint8_t current_odr_idx = 1U;   /* default: 26 Hz */
+
+/* Latest acceleration values - written by TASK_ACC, read by TASK_BLE on READ req */
+volatile int16_t latest_acc_x = 0;
+volatile int16_t latest_acc_y = 0;
+volatile int16_t latest_acc_z = 0;
 
 /* Private function prototypes -----------------------------------------------*/
-/* USER CODE BEGIN FunctionPrototypes */
+static void TaskBLE_Entry(void *argument);
+static void TaskACC_Entry(void *argument);
+static void ACC_Init(void);
+static void ACC_SetODR(uint8_t odr_idx);
 
-/* USER CODE END FunctionPrototypes */
+/* USER CODE BEGIN PFP */
+/* USER CODE END PFP */
 
-void StartDefaultTask(void *argument);
-void TaskBLE(void *argument);
-void TaskACC(void *argument);
-
-void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
-
-/**
-  * @brief  FreeRTOS initialization
-  * @param  None
-  * @retval None
-  */
-void MX_FREERTOS_Init(void) {
+/* =========================================================================
+ * MX_FREERTOS_Init
+ * Called from main() before osKernelStart()
+ * ========================================================================= */
+void MX_FREERTOS_Init(void)
+{
   /* USER CODE BEGIN Init */
-
   /* USER CODE END Init */
-  /* Create the mutex(es) */
-  /* creation of freqMutex */
-  freqMutexHandle = osMutexNew(&freqMutex_attributes);
 
-  /* USER CODE BEGIN RTOS_MUTEX */
-  /* add mutexes, ... */
-  /* USER CODE END RTOS_MUTEX */
+  /* Create semaphore for BLE IRQ signalling */
+  bleSemHandle = osSemaphoreNew(1, 0, NULL);
+  configASSERT(bleSemHandle != NULL);
 
-  /* USER CODE BEGIN RTOS_SEMAPHORES */
-  /* add semaphores, ... */
-  /* USER CODE END RTOS_SEMAPHORES */
+  /* Create mutex for ODR index protection */
+  freqMutexHandle = osMutexNew(NULL);
+  configASSERT(freqMutexHandle != NULL);
 
-  /* USER CODE BEGIN RTOS_TIMERS */
-  /* start timers, add new ones, ... */
-  /* USER CODE END RTOS_TIMERS */
+  /* Create queue: depth=4, item=sizeof(AccelData_t) */
+  accelQueueHandle = osMessageQueueNew(4, sizeof(AccelData_t), NULL);
+  configASSERT(accelQueueHandle != NULL);
 
-  /* Create the queue(s) */
-  /* creation of accelQueue */
-  accelQueueHandle = osMessageQueueNew (4, 6, &accelQueue_attributes);
+  /* Create TASK_BLE */
+  const osThreadAttr_t taskBLE_attr = {
+    .name       = "TASK_BLE",
+    .stack_size = 512 * 4,   /* 512 words */
+    .priority   = osPriorityAboveNormal,
+  };
+  taskBLEHandle = osThreadNew(TaskBLE_Entry, NULL, &taskBLE_attr);
+  configASSERT(taskBLEHandle != NULL);
 
-  /* USER CODE BEGIN RTOS_QUEUES */
-  /* add queues, ... */
-  /* USER CODE END RTOS_QUEUES */
-
-  /* Create the thread(s) */
-  /* creation of defaultTask */
-  defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
-
-  /* creation of Task_BLE */
-  Task_BLEHandle = osThreadNew(TaskBLE, NULL, &Task_BLE_attributes);
-
-  /* creation of Task_ACC */
-  Task_ACCHandle = osThreadNew(TaskACC, NULL, &Task_ACC_attributes);
+  /* Create TASK_ACC */
+  const osThreadAttr_t taskACC_attr = {
+    .name       = "TASK_ACC",
+    .stack_size = 256 * 4,   /* 256 words */
+    .priority   = osPriorityNormal,
+  };
+  taskACCHandle = osThreadNew(TaskACC_Entry, NULL, &taskACC_attr);
+  configASSERT(taskACCHandle != NULL);
 
   /* USER CODE BEGIN RTOS_THREADS */
-  /* add threads, ... */
   /* USER CODE END RTOS_THREADS */
-
-  /* USER CODE BEGIN RTOS_EVENTS */
-  /* add events, ... */
-  /* USER CODE END RTOS_EVENTS */
-
 }
 
-/* USER CODE BEGIN Header_StartDefaultTask */
+/* =========================================================================
+ * TASK_BLE
+ * ========================================================================= */
+
 /**
-  * @brief  Function implementing the defaultTask thread.
-  * @param  argument: Not used
-  * @retval None
-  */
-/* USER CODE END Header_StartDefaultTask */
-void StartDefaultTask(void *argument)
+ * @brief  TASK_BLE entry function.
+ *
+ *         Initialization sequence:
+ *           1. Initialize BLE stack and custom GATT service
+ *
+ *         Event loop:
+ *           2. Wait for BLE IRQ semaphore (timeout 10 ms for queue polling)
+ *           3. Call MX_BlueNRG_MS_Process() to dispatch HCI events
+ *           4. Drain accelQueue and send BLE notifications if connected
+ */
+static void TaskBLE_Entry(void *argument)
 {
-  /* USER CODE BEGIN StartDefaultTask */
-  /* Infinite loop */
-  for(;;)
+  UNUSED(argument);
+
+  /* Step 1: BLE stack initialization */
+  MX_BlueNRG_MS_Init();
+
+  AccelData_t accel;
+
+  for (;;)
   {
-    osDelay(1);
+    /*
+     * Step 2: Wait for BLE IRQ semaphore.
+     * Timeout = 10 ms so we can still drain the accelQueue
+     * even if no BLE IRQ arrives.
+     */
+    osSemaphoreAcquire(bleSemHandle, 10);
+
+    /* Step 3: Process pending HCI events */
+    MX_BlueNRG_MS_Process();
+
+    /* Step 4: Send queued acceleration data as BLE notifications */
+    while (osMessageQueueGet(accelQueueHandle, &accel, NULL, 0) == osOK)
+    {
+      if (ble_connected)
+      {
+        AccData_Update(accel.x, accel.y, accel.z);
+      }
+    }
   }
-  /* USER CODE END StartDefaultTask */
 }
 
-/* USER CODE BEGIN Header_TaskBLE */
+/* =========================================================================
+ * TASK_ACC
+ * ========================================================================= */
+
 /**
-* @brief Function implementing the Task_BLE thread.
-* @param argument: Not used
-* @retval None
-*/
-/* USER CODE END Header_TaskBLE */
-void TaskBLE(void *argument)
+ * @brief  TASK_ACC entry function.
+ *
+ *         Initialization sequence:
+ *           1. Initialize LSM6DSL accelerometer
+ *
+ *         Sampling loop:
+ *           2. Read current ODR index (mutex protected)
+ *           3. Update LSM6DSL ODR if changed
+ *           4. Read XYZ acceleration from LSM6DSL
+ *           5. Update latest_acc_xyz (for READ requests)
+ *           6. Send data to TASK_BLE via accelQueue
+ *           7. Delay for the appropriate period
+ */
+static void TaskACC_Entry(void *argument)
 {
-  /* USER CODE BEGIN TaskBLE */
-  /* Infinite loop */
-  for(;;)
+  UNUSED(argument);
+
+  /* Step 1: Initialize LSM6DSL */
+  ACC_Init();
+
+  uint8_t  local_odr_idx  = 0xFF;  /* invalid sentinel to force first update */
+  uint32_t period_ms;
+  TickType_t last_wake_time;
+  BSP_MOTION_SENSOR_Axes_t axes;
+  AccelData_t accel;
+
+  last_wake_time = xTaskGetTickCount();
+
+  for (;;)
   {
-    osDelay(1);
+    /* Step 2: Read current ODR index */
+    osMutexAcquire(freqMutexHandle, osWaitForever);
+    uint8_t odr_idx = current_odr_idx;
+    osMutexRelease(freqMutexHandle);
+
+    /* Step 3: Update LSM6DSL ODR only if changed */
+    if (odr_idx != local_odr_idx)
+    {
+      ACC_SetODR(odr_idx);
+      local_odr_idx = odr_idx;
+      /* Reset timing reference after ODR change */
+      last_wake_time = xTaskGetTickCount();
+    }
+
+    period_ms = ODR_PERIOD_MS[local_odr_idx];
+
+    /* Step 4: Read acceleration from LSM6DSL */
+    if (BSP_MOTION_SENSOR_GetAxes(0, MOTION_ACCELERO, &axes) == BSP_ERROR_NONE)
+    {
+      /* Step 5: Update latest values for READ requests */
+      latest_acc_x = (int16_t)axes.xval;
+      latest_acc_y = (int16_t)axes.yval;
+      latest_acc_z = (int16_t)axes.zval;
+
+      /* Step 6: Enqueue for TASK_BLE notification */
+      accel.x = (int16_t)axes.xval;
+      accel.y = (int16_t)axes.yval;
+      accel.z = (int16_t)axes.zval;
+
+      /*
+       * osMessageQueuePut with timeout=0: if queue is full, drop the sample.
+       * This prevents TASK_ACC from blocking when BLE is slow.
+       */
+      osMessageQueuePut(accelQueueHandle, &accel, 0, 0);
+    }
+
+    /* Step 7: Delay until next sample period */
+    vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(period_ms));
   }
-  /* USER CODE END TaskBLE */
 }
 
-/* USER CODE BEGIN Header_TaskACC */
+/* =========================================================================
+ * Private helpers
+ * ========================================================================= */
+
 /**
-* @brief Function implementing the Task_ACC thread.
-* @param argument: Not used
-* @retval None
-*/
-/* USER CODE END Header_TaskACC */
-void TaskACC(void *argument)
+ * @brief  Initialize LSM6DSL in accelerometer-only mode.
+ *         Uses official X-CUBE-MEMS1 BSP driver.
+ */
+static void ACC_Init(void)
 {
-  /* USER CODE BEGIN TaskACC */
-  /* Infinite loop */
-  for(;;)
+  int32_t ret;
+
+  ret = BSP_MOTION_SENSOR_Init(0, MOTION_ACCELERO);
+  if (ret != BSP_ERROR_NONE)
   {
-    osDelay(1);
+    PRINTF("ACC_Init: BSP_MOTION_SENSOR_Init failed %ld\r\n", ret);
+    while (1);
   }
-  /* USER CODE END TaskACC */
+
+  /* Enable accelerometer */
+  ret = BSP_MOTION_SENSOR_Enable(0, MOTION_ACCELERO);
+  if (ret != BSP_ERROR_NONE)
+  {
+    PRINTF("ACC_Init: BSP_MOTION_SENSOR_Enable failed %ld\r\n", ret);
+    while (1);
+  }
+
+  /* Set initial ODR */
+  ACC_SetODR(current_odr_idx);
+
+  /* Set full-scale to ±2g (default, gives best resolution) */
+  ret = BSP_MOTION_SENSOR_SetFullScale(0, MOTION_ACCELERO, 2);
+  if (ret != BSP_ERROR_NONE)
+  {
+    PRINTF("ACC_Init: SetFullScale failed %ld\r\n", ret);
+  }
+
+  PRINTF("ACC_Init: LSM6DSL initialized.\r\n");
 }
 
-/* Private application code --------------------------------------------------*/
-/* USER CODE BEGIN Application */
+/**
+ * @brief  Set LSM6DSL accelerometer ODR via BSP driver.
+ * @param  odr_idx  AccODR_Index_t value (0–3)
+ */
+static void ACC_SetODR(uint8_t odr_idx)
+{
+  if (odr_idx > ACC_ODR_MAX)
+  {
+    odr_idx = ACC_ODR_MAX;
+  }
 
-/* USER CODE END Application */
+  int32_t ret = BSP_MOTION_SENSOR_SetOutputDataRate(0,
+                                                     MOTION_ACCELERO,
+                                                     ODR_HZ[odr_idx]);
+  if (ret != BSP_ERROR_NONE)
+  {
+    PRINTF("ACC_SetODR: failed for idx=%d (%.1f Hz), ret=%ld\r\n",
+           odr_idx, (double)ODR_HZ[odr_idx], ret);
+  }
+  else
+  {
+    PRINTF("ACC_SetODR: ODR set to %.1f Hz\r\n", (double)ODR_HZ[odr_idx]);
+  }
+}
 
+/* =========================================================================
+ * BLE IRQ semaphore give - called from hci_tl_lowlevel_isr()
+ * ========================================================================= */
+
+/**
+ * @brief  Called from hci_tl_lowlevel_isr() (EXTI6 ISR context).
+ *         Gives the BLE semaphore to wake TASK_BLE.
+ *
+ *         NOTE: Replace the hci_notify_asynch_evt() call inside
+ *         hci_tl_lowlevel_isr() with this function call.
+ */
+void BLE_IRQ_Notify(void)
+{
+  osSemaphoreRelease(bleSemHandle);
+}

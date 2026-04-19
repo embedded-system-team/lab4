@@ -31,6 +31,8 @@
 /* Private variables ---------------------------------------------------------*/
 EXTI_HandleTypeDef hexti6;
 
+extern void BLE_IRQ_Notify(void);
+
 /******************** IO Operation and BUS services ***************************/
 
 /**
@@ -288,6 +290,6 @@ void hci_tl_lowlevel_isr(void)
   }
 
   /* USER CODE BEGIN hci_tl_lowlevel_isr */
-
+  BLE_IRQ_Notify();
   /* USER CODE END hci_tl_lowlevel_isr */
 }
