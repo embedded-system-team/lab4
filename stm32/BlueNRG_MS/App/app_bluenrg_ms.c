@@ -1,391 +1,376 @@
 /**
   ******************************************************************************
-  * @file    app_bluenrg_ms.c
-  * @author  SRA Application Team
-  * @brief   BlueNRG-M0 initialization and applicative code
-  ******************************************************************************
-  * @attention
+  * @file    App/app_bluenrg_ms.c
+  * @brief   BlueNRG-MS initialization and BLE event handling
   *
-  * Copyright (c) 2026 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
+  *          This file is responsible for:
+  *          - BLE stack initialization (GATT, GAP, custom service)
+  *          - GAP advertisement (set_connectable)
+  *          - GAP connection / disconnection callbacks
+  *          - GATT write request handling (Char_B → ODR index update)
+  *          - GATT read request handling (Char_A)
+  *          - Exposing MX_BlueNRG_MS_Process() for TASK_BLE to call
   ******************************************************************************
   */
 
 /* Includes ------------------------------------------------------------------*/
 #include "app_bluenrg_ms.h"
+#include "gatt_db.h"
 
 #include "hci.h"
 #include "hci_le.h"
 #include "hci_tl.h"
 #include "link_layer.h"
-#include "sensor.h"
-#include "gatt_db.h"
-
-#include "compiler.h"
 #include "bluenrg_utils.h"
-#include "b_l475e_iot01a1.h"
 #include "bluenrg_gap.h"
 #include "bluenrg_gap_aci.h"
 #include "bluenrg_gatt_aci.h"
 #include "bluenrg_hal_aci.h"
+#include "bluenrg_def.h"
 #include "sm.h"
-#include "stm32l4xx_hal_tim.h"
 
-/* USER CODE BEGIN Includes */
-
-/* USER CODE END Includes */
+#include "b_l475e_iot01a1.h"
+#include "cmsis_os2.h"
 
 /* Private defines -----------------------------------------------------------*/
-/**
- * 1 to send environmental and motion data when pushing the user button
- * 0 to send environmental and motion data automatically (period = 1 sec)
- */
-#define USE_BUTTON 0
+#define DEVICE_NAME          "AccSensor"
+#define DEVICE_NAME_LEN      9U
 
-/* Private macros ------------------------------------------------------------*/
+/*
+ * Advertising interval: 100 ms
+ * BlueNRG unit = 0.625 ms → 100 / 0.625 = 160 = 0x00A0
+ */
+#define ADV_INTERVAL_MIN     0x00A0
+#define ADV_INTERVAL_MAX     0x00A0
 
 /* Private variables ---------------------------------------------------------*/
-extern AxesRaw_t x_axes;
-extern AxesRaw_t g_axes;
-extern AxesRaw_t m_axes;
-extern AxesRaw_t q_axes;
 
-extern volatile uint8_t set_connectable;
-extern volatile int     connected;
-/* at startup, suppose the X-NUCLEO-IDB04A1 is used */
-uint8_t bnrg_expansion_board = IDB04A1;
-uint8_t bdaddr[BDADDR_SIZE];
-static volatile uint8_t user_button_init_state = 1;
-static volatile uint8_t user_button_pressed = 0;
+/* BLE connection state - read by TASK_BLE and TASK_ACC */
+volatile uint8_t  ble_connected    = 0;
+volatile uint16_t connection_handle = 0;
 
-/* USER CODE BEGIN PV */
+/* Flag: need to start advertising (set after init or disconnection) */
+volatile uint8_t  set_connectable  = 1;
 
-/* USER CODE END PV */
+/* Board type detection */
+static uint8_t bnrg_expansion_board = IDB04A1;
+
+/* BD address read from BlueNRG */
+static uint8_t bdaddr[BDADDR_SIZE];
+
+/* FreeRTOS semaphore handle - given by EXTI ISR, taken by TASK_BLE */
+extern osSemaphoreId_t bleSemHandle;
+
+/* Current ODR index - protected by freqMutex, written here, read by TASK_ACC */
+extern osMutexId_t     freqMutexHandle;
+extern volatile uint8_t current_odr_idx;
+
+/* Latest accel values for READ request - written by TASK_ACC */
+extern volatile int16_t latest_acc_x;
+extern volatile int16_t latest_acc_y;
+extern volatile int16_t latest_acc_z;
 
 /* Private function prototypes -----------------------------------------------*/
-static void User_Process(void);
-static void User_Init(void);
-static void Set_Random_Environmental_Values(float *data_t, float *data_p);
-static void Set_Random_Motion_Values(uint32_t cnt);
-static void Reset_Motion_Values(void);
+static void BLE_SetConnectable(void);
 
-/* USER CODE BEGIN PFP */
+/* =========================================================================
+ * Public API
+ * ========================================================================= */
 
-/* USER CODE END PFP */
-
-#if PRINT_CSV_FORMAT
-extern volatile uint32_t ms_counter;
 /**
- * @brief  This function is a utility to print the log time
- *         in the format HH:MM:SS:MSS (DK GUI time format)
- * @param  None
- * @retval None
+ * @brief  Initialize BLE stack, GATT service and start advertising.
+ *         Called once from TASK_BLE before entering the event loop.
  */
-void print_csv_time(void){
-  uint32_t ms = HAL_GetTick();
-  PRINT_CSV("%02ld:%02ld:%02ld.%03ld", (long)(ms/(60*60*1000)%24), (long)(ms/(60*1000)%60), (long)((ms/1000)%60), (long)(ms%1000));
-}
-#endif
-
 void MX_BlueNRG_MS_Init(void)
 {
-  /* USER CODE BEGIN SV */
-
-  /* USER CODE END SV */
-
-  /* USER CODE BEGIN BlueNRG_MS_Init_PreTreatment */
-
-  /* USER CODE END BlueNRG_MS_Init_PreTreatment */
-
-  /* Initialize the peripherals and the BLE Stack */
-  const char *name = "BlueNRG";
-  uint16_t service_handle, dev_name_char_handle, appearance_char_handle;
-
   uint8_t  bdaddr_len_out;
   uint8_t  hwVersion;
   uint16_t fwVersion;
-  int ret;
+  uint16_t service_handle, dev_name_char_handle, appearance_char_handle;
+  int      ret;
 
-  User_Init();
-
-  /* Get the User Button initial state */
-  user_button_init_state = BSP_PB_GetState(BUTTON_KEY);
-
+  /* Initialize HCI transport layer */
   hci_init(user_notify, NULL);
 
-  /* get the BlueNRG HW and FW versions */
+  /* Read BlueNRG HW/FW version */
   getBlueNRGVersion(&hwVersion, &fwVersion);
+  PRINTF("BlueNRG HWver=%d FWver=%d\r\n", hwVersion, fwVersion);
+
+  if (hwVersion > 0x30)
+  {
+    bnrg_expansion_board = IDB05A1;
+  }
 
   /*
-   * Reset BlueNRG again otherwise we won't
-   * be able to change its MAC address.
-   * aci_hal_write_config_data() must be the first
-   * command after reset otherwise it will fail.
+   * Reset BlueNRG before writing config data.
+   * aci_hal_write_config_data() must be the first command after reset.
    */
   hci_reset();
   HAL_Delay(100);
 
-  PRINTF("HWver %d\nFWver %d\n", hwVersion, fwVersion);
-  if (hwVersion > 0x30) { /* X-NUCLEO-IDB05A1 expansion board is used */
-    bnrg_expansion_board = IDB05A1;
+  /* Read static random address */
+  ret = aci_hal_read_config_data(CONFIG_DATA_RANDOM_ADDRESS,
+                                 BDADDR_SIZE,
+                                 &bdaddr_len_out,
+                                 bdaddr);
+  if (ret)
+  {
+    PRINTF("BLE Init: read BD address failed 0x%02X\r\n", ret);
   }
 
-  ret = aci_hal_read_config_data(CONFIG_DATA_RANDOM_ADDRESS, BDADDR_SIZE, &bdaddr_len_out, bdaddr);
-
-  if (ret) {
-    PRINTF("Read Static Random address failed.\n");
+  if ((bdaddr[5] & 0xC0) != 0xC0)
+  {
+    PRINTF("BLE Init: invalid static random address\r\n");
+    while (1);
   }
 
-  if ((bdaddr[5] & 0xC0) != 0xC0) {
-    PRINTF("Static Random address not well formed.\n");
-    while(1);
-  }
-
-  /* GATT Init */
+  /* GATT initialization */
   ret = aci_gatt_init();
-  if(ret){
-    PRINTF("GATT_Init failed.\n");
+  if (ret != BLE_STATUS_SUCCESS)
+  {
+    PRINTF("BLE Init: aci_gatt_init failed 0x%02X\r\n", ret);
+    while (1);
   }
 
-  /* GAP Init */
-  if (bnrg_expansion_board == IDB05A1) {
-    ret = aci_gap_init_IDB05A1(GAP_PERIPHERAL_ROLE_IDB05A1, 0, 0x07, &service_handle, &dev_name_char_handle, &appearance_char_handle);
+  /* GAP initialization - peripheral role */
+  if (bnrg_expansion_board == IDB05A1)
+  {
+    ret = aci_gap_init_IDB05A1(GAP_PERIPHERAL_ROLE_IDB05A1,
+                               0,
+                               DEVICE_NAME_LEN,
+                               &service_handle,
+                               &dev_name_char_handle,
+                               &appearance_char_handle);
   }
-  else {
-    ret = aci_gap_init_IDB04A1(GAP_PERIPHERAL_ROLE_IDB04A1, &service_handle, &dev_name_char_handle, &appearance_char_handle);
-  }
-  if (ret != BLE_STATUS_SUCCESS) {
-    PRINTF("GAP_Init failed.\n");
+  else
+  {
+    ret = aci_gap_init_IDB04A1(GAP_PERIPHERAL_ROLE_IDB04A1,
+                               &service_handle,
+                               &dev_name_char_handle,
+                               &appearance_char_handle);
   }
 
-  /* Update device name */
-  ret = aci_gatt_update_char_value(service_handle, dev_name_char_handle, 0,
-                                   strlen(name), (uint8_t *)name);
-  if (ret) {
-    PRINTF("aci_gatt_update_char_value failed.\n");
-    while(1);
+  if (ret != BLE_STATUS_SUCCESS)
+  {
+    PRINTF("BLE Init: aci_gap_init failed 0x%02X\r\n", ret);
+    while (1);
   }
 
-  ret = aci_gap_set_auth_requirement(MITM_PROTECTION_REQUIRED,
+  /* Set device name */
+  ret = aci_gatt_update_char_value(service_handle,
+                                   dev_name_char_handle,
+                                   0,
+                                   DEVICE_NAME_LEN,
+                                   (uint8_t *)DEVICE_NAME);
+  if (ret != BLE_STATUS_SUCCESS)
+  {
+    PRINTF("BLE Init: set device name failed 0x%02X\r\n", ret);
+    while (1);
+  }
+
+  /* Set authentication requirements - no MITM, no bonding for simplicity */
+  ret = aci_gap_set_auth_requirement(MITM_PROTECTION_NOT_REQUIRED,
                                      OOB_AUTH_DATA_ABSENT,
                                      NULL,
                                      7,
                                      16,
                                      USE_FIXED_PIN_FOR_PAIRING,
                                      123456,
-                                     BONDING);
-  if (ret) {
-    PRINTF("aci_gap_set_authentication_requirement failed.\n");
-    while(1);
+                                     NO_BONDING);
+  if (ret != BLE_STATUS_SUCCESS)
+  {
+    PRINTF("BLE Init: set auth requirement failed 0x%02X\r\n", ret);
+    while (1);
   }
 
-  PRINTF("BLE Stack Initialized\n");
+  /* Set TX power level */
+  aci_hal_set_tx_power_level(1, 4);
 
-  ret = Add_HWServW2ST_Service();
-  if(ret == BLE_STATUS_SUCCESS) {
-    PRINTF("BlueMS HW service added successfully.\n");
-  } else {
-    PRINTF("Error while adding BlueMS HW service: 0x%02x\r\n", ret);
-    while(1);
+  /* Add custom Accelerometer GATT service */
+  ret = Add_AccService();
+  if (ret != BLE_STATUS_SUCCESS)
+  {
+    PRINTF("BLE Init: Add_AccService failed 0x%02X\r\n", ret);
+    while (1);
   }
 
-  ret = Add_SWServW2ST_Service();
-  if(ret == BLE_STATUS_SUCCESS) {
-     PRINTF("BlueMS SW service added successfully.\n");
-  } else {
-     PRINTF("Error while adding BlueMS HW service: 0x%02x\r\n", ret);
-     while(1);
-  }
+  PRINTF("BLE Init: complete. Device name: %s\r\n", DEVICE_NAME);
 
-  /* Set output power level */
-  ret = aci_hal_set_tx_power_level(1,4);
-
-  /* USER CODE BEGIN BlueNRG_MS_Init_PostTreatment */
-
-  /* USER CODE END BlueNRG_MS_Init_PostTreatment */
+  /* Start advertising immediately */
+  BLE_SetConnectable();
+  set_connectable = 0;
 }
 
-/*
- * BlueNRG-MS background task
+/**
+ * @brief  Process pending BLE HCI events.
+ *         Called by TASK_BLE after semaphore is given by EXTI ISR.
  */
 void MX_BlueNRG_MS_Process(void)
 {
-  /* USER CODE BEGIN BlueNRG_MS_Process_PreTreatment */
-
-  /* USER CODE END BlueNRG_MS_Process_PreTreatment */
-
-  User_Process();
-  hci_user_evt_proc();
-
-  /* USER CODE BEGIN BlueNRG_MS_Process_PostTreatment */
-
-  /* USER CODE END BlueNRG_MS_Process_PostTreatment */
-}
-
-/**
- * @brief  Initialize User process.
- *
- * @param  None
- * @retval None
- */
-static void User_Init(void)
-{
-  BSP_PB_Init(BUTTON_KEY, BUTTON_MODE_EXTI);
-  BSP_LED_Init(LED2);
-
-  BSP_COM_Init(COM1);
-}
-
-/**
- * @brief  Process user input (i.e. pressing the USER button on Nucleo board)
- *         and send the updated acceleration data to the remote client.
- *
- * @param  None
- * @retval None
- */
-static void User_Process(void)
-{
-  float data_t;
-  float data_p;
-  static uint32_t counter = 0;
-
   if (set_connectable)
   {
-    Set_DeviceConnectable();
-    set_connectable = FALSE;
+    BLE_SetConnectable();
+    set_connectable = 0;
   }
 
-#if USE_BUTTON
-  /* Check if the user has pushed the button */
-  if (user_button_pressed)
+  hci_user_evt_proc();
+}
+
+/* =========================================================================
+ * Private functions
+ * ========================================================================= */
+
+/**
+ * @brief  Configure GAP advertisement and start undirected advertising.
+ */
+static void BLE_SetConnectable(void)
+{
+  tBleStatus ret;
+
+  uint8_t local_name[] = {
+    AD_TYPE_COMPLETE_LOCAL_NAME,
+    'A','c','c','S','e','n','s','o','r'
+  };
+
+  /* Stop any ongoing advertising before reconfiguring */
+  hci_le_set_advertise_enable(0);
+
+  /* Set advertising type and interval */
+  ret = aci_gap_set_discoverable(ADV_IND,
+                                 ADV_INTERVAL_MIN,
+                                 ADV_INTERVAL_MAX,
+                                 STATIC_RANDOM_ADDR,
+                                 NO_WHITE_LIST_USE,
+                                 sizeof(local_name),
+                                 local_name,
+                                 0,
+                                 NULL,
+                                 0,
+                                 0);
+  if (ret != BLE_STATUS_SUCCESS)
   {
-    /* Debouncing */
-    HAL_Delay(50);
+    PRINTF("BLE_SetConnectable failed: 0x%02X\r\n", ret);
+  }
+  else
+  {
+    PRINTF("BLE: advertising started.\r\n");
+  }
+}
 
-    /* Wait until the User Button is released */
-    while (BSP_PB_GetState(BUTTON_KEY) == !user_button_init_state);
+/* =========================================================================
+ * HCI / GAP / GATT Event Callbacks
+ * These are called from hci_user_evt_proc() inside TASK_BLE context.
+ * ========================================================================= */
 
-    /* Debouncing */
-    HAL_Delay(50);
-#endif
-    BSP_LED_Toggle(LED2);
+/**
+ * @brief  HCI event notification callback.
+ *         Dispatches GAP and GATT events.
+ */
+void user_notify(void *pData)
+{
+  hci_uart_pckt *hci_pckt = (hci_uart_pckt *)pData;
 
-    if (connected)
+  if (hci_pckt->type != HCI_EVENT_PKT)
+  {
+    return;
+  }
+
+  hci_event_pckt *event_pckt = (hci_event_pckt *)hci_pckt->data;
+
+  switch (event_pckt->evt)
+  {
+    /* ---- Vendor-specific events (GAP + GATT) ---- */
+    case EVT_VENDOR:
     {
-      /* Set a random seed */
-      srand(HAL_GetTick());
+      evt_blue_aci *blue_evt = (evt_blue_aci *)event_pckt->data;
 
-      /* Update emulated Environmental data */
-      Set_Random_Environmental_Values(&data_t, &data_p);
-      BlueMS_Environmental_Update((int32_t)(data_p *100), (int16_t)(data_t * 10));
+      switch (blue_evt->ecode)
+      {
+        /* GAP: connection established */
+        case EVT_BLUE_GAP_CONNECTED:
+        {
+          evt_le_connection_complete *cc =
+            (evt_le_connection_complete *)blue_evt->data;
 
-      /* Update emulated Acceleration, Gyroscope and Sensor Fusion data */
-      Set_Random_Motion_Values(counter);
-      Acc_Update(&x_axes, &g_axes, &m_axes);
-      Quat_Update(&q_axes);
+          ble_connected    = 1;
+          connection_handle = cc->handle;
+          PRINTF("BLE: connected. Handle=0x%04X\r\n", connection_handle);
+          BSP_LED_On(LED2);
+          break;
+        }
 
-      counter ++;
-      if (counter == 40) {
-        counter = 0;
-        Reset_Motion_Values();
+        /* GAP: disconnection */
+        case EVT_BLUE_GAP_DISCONNECTED:
+        {
+          ble_connected    = 0;
+          connection_handle = 0;
+          PRINTF("BLE: disconnected.\r\n");
+          BSP_LED_Off(LED2);
+
+          /* Restart advertising */
+          set_connectable = 1;
+          break;
+        }
+
+        /* GATT: attribute modified (Char_B write from client) */
+        case EVT_BLUE_GATT_ATTRIBUTE_MODIFIED:
+        {
+          evt_gatt_attr_modified_IDB05A1 *evt =
+            (evt_gatt_attr_modified_IDB05A1 *)blue_evt->data;
+
+          /*
+           * AccFreqCharHandle + 1 is the value attribute handle.
+           * BlueNRG reports the value attribute handle on write.
+           */
+          if (evt->attr_handle == (AccFreqCharHandle + 1))
+          {
+            uint8_t new_idx = evt->att_data[0];
+
+            /* Validate range */
+            if (new_idx > ACC_ODR_MAX)
+            {
+              PRINTF("BLE: invalid ODR index %d, ignoring.\r\n", new_idx);
+              break;
+            }
+
+            /* Update shared ODR index under mutex */
+            osMutexAcquire(freqMutexHandle, osWaitForever);
+            current_odr_idx = new_idx;
+            osMutexRelease(freqMutexHandle);
+
+            /* Acknowledge: update Char_B readable value */
+            aci_gatt_update_char_value(AccServiceHandle,
+                                       AccFreqCharHandle,
+                                       0, 1, &new_idx);
+
+            PRINTF("BLE: ODR index updated to %d\r\n", new_idx);
+          }
+          break;
+        }
+
+        /* GATT: read request on Char_A */
+        case EVT_BLUE_GATT_READ_PERMIT_REQ:
+        {
+          evt_gatt_read_permit_req *evt =
+            (evt_gatt_read_permit_req *)blue_evt->data;
+
+          if (evt->attr_handle == (AccDataCharHandle + 1))
+          {
+            AccData_ReadRequestCB(connection_handle,
+                                  latest_acc_x,
+                                  latest_acc_y,
+                                  latest_acc_z);
+          }
+          break;
+        }
+
+        default:
+          break;
       }
-#if !USE_BUTTON
-      HAL_Delay(1000); /* wait 1 sec before sending new data */
-#endif
+      break;
     }
-#if USE_BUTTON
-    /* Reset the User Button flag */
-    user_button_pressed = 0;
+
+    default:
+      break;
   }
-#endif
-}
-
-/**
- * @brief  Set random values for all environmental sensor data
- * @param  float pointer to temperature data
- * @param  float pointer to pressure data
- * @retval None
- */
-static void Set_Random_Environmental_Values(float *data_t, float *data_p)
-{
-  *data_t = 27.0 + ((uint64_t)rand()*5)/RAND_MAX;     /* T sensor emulation */
-  *data_p = 1000.0 + ((uint64_t)rand()*80)/RAND_MAX; /* P sensor emulation */
-}
-
-/**
- * @brief  Set random values for all motion sensor data
- * @param  uint32_t counter for changing the rotation direction
- * @retval None
- */
-static void Set_Random_Motion_Values(uint32_t cnt)
-{
-  /* Update Acceleration, Gyroscope and Sensor Fusion data */
-  if (cnt < 20) {
-    x_axes.AXIS_X +=  (10  + ((uint64_t)rand()*3*cnt)/RAND_MAX);
-    x_axes.AXIS_Y += -(10  + ((uint64_t)rand()*5*cnt)/RAND_MAX);
-    x_axes.AXIS_Z +=  (10  + ((uint64_t)rand()*7*cnt)/RAND_MAX);
-    g_axes.AXIS_X +=  (100 + ((uint64_t)rand()*2*cnt)/RAND_MAX);
-    g_axes.AXIS_Y += -(100 + ((uint64_t)rand()*4*cnt)/RAND_MAX);
-    g_axes.AXIS_Z +=  (100 + ((uint64_t)rand()*6*cnt)/RAND_MAX);
-    m_axes.AXIS_X +=  (3  + ((uint64_t)rand()*3*cnt)/RAND_MAX);
-    m_axes.AXIS_Y += -(3  + ((uint64_t)rand()*4*cnt)/RAND_MAX);
-    m_axes.AXIS_Z +=  (3  + ((uint64_t)rand()*5*cnt)/RAND_MAX);
-
-    q_axes.AXIS_X -= (100  + ((uint64_t)rand()*3*cnt)/RAND_MAX);
-    q_axes.AXIS_Y += (100  + ((uint64_t)rand()*5*cnt)/RAND_MAX);
-    q_axes.AXIS_Z -= (100  + ((uint64_t)rand()*7*cnt)/RAND_MAX);
-  }
-  else {
-    x_axes.AXIS_X += -(10  + ((uint64_t)rand()*3*cnt)/RAND_MAX);
-    x_axes.AXIS_Y +=  (10  + ((uint64_t)rand()*5*cnt)/RAND_MAX);
-    x_axes.AXIS_Z += -(10  + ((uint64_t)rand()*7*cnt)/RAND_MAX);
-    g_axes.AXIS_X += -(100 + ((uint64_t)rand()*2*cnt)/RAND_MAX);
-    g_axes.AXIS_Y +=  (100 + ((uint64_t)rand()*4*cnt)/RAND_MAX);
-    g_axes.AXIS_Z += -(100 + ((uint64_t)rand()*6*cnt)/RAND_MAX);
-    m_axes.AXIS_X += -(3  + ((uint64_t)rand()*7*cnt)/RAND_MAX);
-    m_axes.AXIS_Y +=  (3  + ((uint64_t)rand()*9*cnt)/RAND_MAX);
-    m_axes.AXIS_Z += -(3  + ((uint64_t)rand()*3*cnt)/RAND_MAX);
-
-    q_axes.AXIS_X += (200 + ((uint64_t)rand()*7*cnt)/RAND_MAX);
-    q_axes.AXIS_Y -= (150 + ((uint64_t)rand()*3*cnt)/RAND_MAX);
-    q_axes.AXIS_Z += (10  + ((uint64_t)rand()*5*cnt)/RAND_MAX);
-  }
-
-}
-
-/**
- * @brief  Reset values for all motion sensor data
- * @param  None
- * @retval None
- */
-static void Reset_Motion_Values(void)
-{
-  x_axes.AXIS_X = (x_axes.AXIS_X)%2000 == 0 ? -x_axes.AXIS_X : 10;
-  x_axes.AXIS_Y = (x_axes.AXIS_Y)%2000 == 0 ? -x_axes.AXIS_Y : -10;
-  x_axes.AXIS_Z = (x_axes.AXIS_Z)%2000 == 0 ? -x_axes.AXIS_Z : 10;
-  g_axes.AXIS_X = (g_axes.AXIS_X)%2000 == 0 ? -g_axes.AXIS_X : 100;
-  g_axes.AXIS_Y = (g_axes.AXIS_Y)%2000 == 0 ? -g_axes.AXIS_Y : -100;
-  g_axes.AXIS_Z = (g_axes.AXIS_Z)%2000 == 0 ? -g_axes.AXIS_Z : 100;
-  m_axes.AXIS_X = (g_axes.AXIS_X)%2000 == 0 ? -m_axes.AXIS_X : 3;
-  m_axes.AXIS_Y = (g_axes.AXIS_Y)%2000 == 0 ? -m_axes.AXIS_Y : -3;
-  m_axes.AXIS_Z = (g_axes.AXIS_Z)%2000 == 0 ? -m_axes.AXIS_Z : 3;
-  q_axes.AXIS_X = -q_axes.AXIS_X;
-  q_axes.AXIS_Y = -q_axes.AXIS_Y;
-  q_axes.AXIS_Z = -q_axes.AXIS_Z;
-}
-
-/**
-  * @brief  BSP Push Button callback
-  * @param  Button Specifies the pin connected EXTI line
-  * @retval None.
-  */
-void BSP_PB_Callback(Button_TypeDef Button)
-{
-  /* Set the User Button flag */
-  user_button_pressed = 1;
 }
