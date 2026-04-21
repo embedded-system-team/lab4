@@ -198,7 +198,11 @@ void TIM1_UP_TIM16_IRQHandler(void)
 void EXTI15_10_IRQHandler(void)
 {
   /* USER CODE BEGIN EXTI15_10_IRQn 0 */
-
+  extern void Motion_IRQ_Notify(void);
+  if (__HAL_GPIO_EXTI_GET_IT(LSM6DSL_INT1_EXTI11_Pin))
+  {
+    Motion_IRQ_Notify();
+  }
   /* USER CODE END EXTI15_10_IRQn 0 */
   HAL_GPIO_EXTI_IRQHandler(LPS22HB_INT_DRDY_EXTI0_Pin);
   HAL_GPIO_EXTI_IRQHandler(LSM6DSL_INT1_EXTI11_Pin);
